@@ -144,6 +144,45 @@ def set_status(tid: int):
         db.session.rollback()
         app.logger.error(f"/status error: {e}")
         return jsonify({"ok": False, "error": "server_error"}), 500
+        @app.get("/api/tickets")
+def list_tickets():
+    """Список заявок с фильтрами: ?status=new|in_progress|done&club=...&days=...&limit=..."""
+    try:
+        q = Ticket.query
+
+        status = request.args.get("status")
+        club = request.args.get("club")
+        days = request.args.get("days", type=int)
+        limit = request.args.get("limit", default=100, type=int)
+
+        if status in ("new", "in_progress", "done"):
+            q = q.filter(Ticket.status == status)
+        if club:
+            q = q.filter(Ticket.club == club)
+        if days and days > 0:
+            since = datetime.datetime.now(tz=KZ_TZ) - datetime.timedelta(days=days)
+            q = q.filter(Ticket.created_at >= since)
+
+        q = q.order_by(Ticket.status.asc(), Ticket.deadline.asc(), Ticket.created_at.desc())
+        rows = q.limit(min(limit, 500)).all()
+
+        def ser(t: Ticket):
+            return {
+                "id": t.id,
+                "club": t.club,
+                "pc": t.pc,
+                "description": t.description,
+                "deadline": t.deadline.isoformat(),
+                "status": t.status,
+                "created_at": t.created_at.isoformat(),
+                "last_reminded_at": t.last_reminded_at.isoformat() if t.last_reminded_at else None,
+            }
+
+        return jsonify({"ok": True, "items": [ser(t) for t in rows]})
+    except Exception as e:
+        app.logger.error(f"/api/tickets GET error: {e}")
+        return jsonify({"ok": False, "error": "server_error"}), 500
+
 
 # -------------------- Cron: reminders ----------------
 @app.get("/cron/remind")
@@ -260,3 +299,4 @@ def telegram_webhook():
 # -------------------- Local run ----------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
