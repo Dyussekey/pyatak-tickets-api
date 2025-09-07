@@ -250,7 +250,7 @@ def telegram_webhook():
     upd = request.get_json(force=True) or {}
     app.logger.info("tg update: %s", json.dumps(upd)[:1000])
 
-    # 2) Обычные сообщения (команды)
+        # 2) Обычные сообщения (команды)
     msg = upd.get("message")
     if msg:
         chat = msg.get("chat", {})
@@ -260,13 +260,15 @@ def telegram_webhook():
         chat_id = chat.get("id")
         text_in = (msg.get("text") or "").strip()
 
+        # /start /help
         if text_in in ("/start", "/help"):
             tg_api("sendMessage", {
                 "chat_id": chat_id,
-                "text": "Привет! Я присылаю заявки и меняю статусы по кнопкам.\nКоманды: /start, /help, /id"
+                "text": "Привет! Я присылаю заявки и меняю статусы по кнопкам.\nКоманды: /start, /help, /id, /work <ID>, /done <ID>"
             })
             return "ok"
 
+        # /id — узнать свой chat_id
         if text_in == "/id":
             tg_api("sendMessage", {
                 "chat_id": chat_id,
@@ -274,9 +276,42 @@ def telegram_webhook():
                 "parse_mode": "HTML"
             })
             return "ok"
-            
-           
+
+        # /done <ID> — статус → Выполнено
+        if text_in.startswith("/done"):
+            parts = text_in.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                sid = int(parts[1])
+                t = db.session.get(Ticket, sid)
+                if not t:
+                    tg_api("sendMessage", {"chat_id": chat_id, "text": f"ID {sid} не найден"})
+                else:
+                    t.status = "done"
+                    db.session.commit()
+                    tg_api("sendMessage", {"chat_id": chat_id, "text": f"Заявка {sid}: статус → Выполнено ✅"})
+            else:
+                tg_api("sendMessage", {"chat_id": chat_id, "text": "Использование: /done <ID>"})
+            return "ok"
+
+        # /work <ID> — статус → В работе
+        if text_in.startswith("/work"):
+            parts = text_in.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                sid = int(parts[1])
+                t = db.session.get(Ticket, sid)
+                if not t:
+                    tg_api("sendMessage", {"chat_id": chat_id, "text": f"ID {sid} не найден"})
+                else:
+                    t.status = "in_progress"
+                    db.session.commit()
+                    tg_api("sendMessage", {"chat_id": chat_id, "text": f"Заявка {sid}: статус → В работе 🔄"})
+            else:
+                tg_api("sendMessage", {"chat_id": chat_id, "text": "Использование: /work <ID>"})
+            return "ok"
+
+        # ничего не делаем для иных сообщений
         return "ok"
+
 
      if text_in.startswith("/done"):
     parts = text_in.split()
@@ -397,6 +432,7 @@ if text_in.startswith("/work"):
 # -------------------- Local run ----------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
 
 
 
