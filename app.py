@@ -219,31 +219,109 @@ def health():
         return "db unavailable", 500
 
 # -------------------- Telegram webhook ----------------
+def _chat_allowed(chat: dict) -> bool:
+    """Пускаем апдейты, если TELEGRAM_CHAT_ID пуст
+       или совпадает с числовым id, или с @username, или с title канала/группы."""
+    expected = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
+    if not expected:
+        return True
+    cid = str(chat.get("id", ""))
+    uname = chat.get("username")  # без @
+    title = chat.get("title")     # имя канала/группы
+    variants = {cid}
+    if uname:
+        variants.add(f"@{uname}")
+    if title:
+        variants.add(title)
+    return expected in variants
+
 @app.post("/telegram/webhook")
 def telegram_webhook():
+    # 1) Проверка секрета из заголовка
     secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
     recv = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if secret and recv != secret:
         return "forbidden", 403
 
     upd = request.get_json(force=True) or {}
-    app.logger.info(f"tg update: {json.dumps(upd)[:500]}")
+    app.logger.info("tg update: %s", json.dumps(upd)[:1000])
 
-    owner_chat = str(os.getenv("TELEGRAM_CHAT_ID", ""))
-
-    # команды
+    # 2) Обычные сообщения (команды)
     msg = upd.get("message")
     if msg:
-        chat_id = str(msg.get("chat", {}).get("id", ""))
-        if chat_id != owner_chat:
+        chat = msg.get("chat", {})
+        if not _chat_allowed(chat):
             return "ok"
+
+        chat_id = chat.get("id")
         text_in = (msg.get("text") or "").strip()
+
         if text_in in ("/start", "/help"):
             tg_api("sendMessage", {
                 "chat_id": chat_id,
-                "text": "Я присылаю заявки и принимаю статусы по кнопкам. Команды: /start, /help"
+                "text": "Привет! Я присылаю заявки и меняю статусы по кнопкам.\nКоманды: /start, /help, /id"
             })
             return "ok"
+
+        if text_in == "/id":
+            tg_api("sendMessage", {
+                "chat_id": chat_id,
+                "text": f"Ваш chat_id: <code>{chat_id}</code>",
+                "parse_mode": "HTML"
+            })
+            return "ok"
+
+        return "ok"
+
+    # 3) Нажатия на кнопки
+    cq = upd.get("callback_query")
+    if cq:
+        message = cq.get("message") or {}
+        chat = message.get("chat") or {}
+        if not _chat_allowed(chat):
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "Недоступно"})
+            return "ok"
+
+        data = cq.get("data") or ""
+        chat_id = message.get("chat", {}).get("id")
+        message_id = message.get("message_id")
+
+        if not data.startswith("status:"):
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "Неизвестное действие"})
+            return "ok"
+
+        try:
+            _, sid, new_status = data.split(":")
+            sid = int(sid)
+        except Exception:
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "Ошибка данных"})
+            return "ok"
+
+        if new_status not in ("in_progress", "done"):
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "Неверный статус"})
+            return "ok"
+
+        t = Ticket.query.get(sid)
+        if not t:
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "Заявка не найдена"})
+            return "ok"
+
+        t.status = new_status
+        db.session.commit()
+
+        # короткий ответ по нажатию
+        tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"Статус: {new_status}"})
+        # обновляем текст исходного сообщения
+        tg_api("editMessageText", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": msg_ticket_text(t, "Заявка"),
+            "parse_mode": "HTML"
+        })
+        return "ok"
+
+    return "ok"
+
 
     # кнопки
     cq = upd.get("callback_query")
@@ -284,3 +362,4 @@ def telegram_webhook():
 # -------------------- Local run ----------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
