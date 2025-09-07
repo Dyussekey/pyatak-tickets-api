@@ -250,7 +250,7 @@ def telegram_webhook():
     upd = request.get_json(force=True) or {}
     app.logger.info("tg update: %s", json.dumps(upd)[:1000])
 
-        # 2) Обычные сообщения (команды)
+            # 2) Обычные сообщения (команды)
     msg = upd.get("message")
     if msg:
         chat = msg.get("chat", {})
@@ -309,8 +309,9 @@ def telegram_webhook():
                 tg_api("sendMessage", {"chat_id": chat_id, "text": "Использование: /work <ID>"})
             return "ok"
 
-        # ничего не делаем для иных сообщений
+        # прочие сообщения игнорируем
         return "ok"
+
 
 
      if text_in.startswith("/done"):
@@ -432,6 +433,7 @@ if text_in.startswith("/work"):
 # -------------------- Local run ----------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
 
 
 
