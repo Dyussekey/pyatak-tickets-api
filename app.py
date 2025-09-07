@@ -58,10 +58,14 @@ class Ticket(db.Model):
     club = db.Column(db.String(50), nullable=False)
     pc = db.Column(db.String(50), nullable=True)
     description = db.Column(db.Text, nullable=False)
-    status = db.Column(db.String(20), nullable=False, default="new")  # new | in_progress | done
-    deadline_at = db.Column(db.DateTime, nullable=True)
+    status = db.Column(db.String(20), nullable=False, default="new")
+    # ВАЖНО: маппим python-поле deadline_at на колонку "deadline" в БД
+    deadline_at = db.Column("deadline", db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     updated_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    tg_chat_id = db.Column(db.BigInteger, nullable=True)
+    tg_message_id = db.Column(db.BigInteger, nullable=True)
+
 
     # Для редактирования исходного сообщения в Telegram
     tg_chat_id = db.Column(db.BigInteger, nullable=True)
@@ -470,3 +474,4 @@ def cron_remind():
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
