@@ -19,14 +19,11 @@ CORS(app, resources={r"/api/*": {"origins": os.getenv("CORS_ORIGIN", "*")}})
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
-
-# Нормализуем старый формат
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-# Пул/пинг — переживать «сон» соединений у бесплатных БД
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_pre_ping": True,
     "pool_recycle": 280,
@@ -47,12 +44,11 @@ class Ticket(db.Model):
     club = db.Column(db.String(64), nullable=False)
     pc = db.Column(db.String(64), nullable=False)
     description = db.Column(db.Text, nullable=False)
-    deadline = db.Column(db.DateTime, nullable=False)  # хранится с tzinfo=Asia/Almaty
+    deadline = db.Column(db.DateTime, nullable=False)  # tz=Asia/Almaty
     status = db.Column(db.String(16), default="new")   # new|in_progress|done
     created_at = db.Column(db.DateTime, default=lambda: datetime.datetime.now(tz=KZ_TZ))
     last_reminded_at = db.Column(db.DateTime, nullable=True)
 
-# Мягкий старт БД (если Neon/Render проснулся не сразу)
 def init_db_with_retry(retries=5, delay=2):
     for i in range(retries):
         try:
@@ -80,24 +76,33 @@ def tg_api(method: str, payload: dict):
     except Exception as e:
         app.logger.error(f"tg_api error: {e}")
 
+def msg_ticket_text(t: Ticket, title="Новая заявка"):
+    return (
+        f"🧾 <b>{title}</b>\n"
+        f"🏢 <b>Клуб:</b> {t.club}\n"
+        f"💻 <b>ПК/Зона:</b> {t.pc}\n"
+        f"❗ <b>Проблема:</b> {t.description}\n"
+        f"⏰ <b>Срок:</b> {t.deadline.strftime('%d.%m %H:%M')}  ·  ID {t.id}"
+    )
+
 def notify_telegram_new_ticket(t: Ticket):
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not chat_id:
         return
-    text_msg = (
-        f"🆕 <b>Новая заявка</b>\n"
-        f"🏢 Клуб: {t.club}\n💻 ПК: {t.pc}\n❗ {t.description}\n"
-        f"⏰ Срок: {t.deadline.strftime('%d.%m %H:%M')}  ·  ID {t.id}"
-    )
     kb = {
-        "inline_keyboard": [[
-            {"text": "🔄 В работе", "callback_data": f"status:{t.id}:in_progress"},
-            {"text": "✅ Выполнено", "callback_data": f"status:{t.id}:done"}
-        ]]
+        "inline_keyboard": [
+            [
+                {"text": "🔄 В работе", "callback_data": f"status:{t.id}:in_progress"},
+                {"text": "✅ Выполнено", "callback_data": f"status:{t.id}:done"}
+            ],
+            [
+                {"text": "📜 Открыть историю", "url": os.getenv("CORS_ORIGIN", "#") + "/history.html"}
+            ]
+        ]
     }
     tg_api("sendMessage", {
         "chat_id": chat_id,
-        "text": text_msg,
+        "text": msg_ticket_text(t, "Новая заявка"),
         "parse_mode": "HTML",
         "reply_markup": kb
     })
@@ -111,22 +116,51 @@ def create_ticket():
         pc = data.get("pc")
         desc = data.get("description")
         deadline_iso = data.get("deadline_iso")  # локальное ISO: YYYY-MM-DDTHH:MM:SS
-
         if not all([club, pc, desc, deadline_iso]):
             return jsonify({"ok": False, "error": "club, pc, description, deadline_iso required"}), 400
 
-        # Трактуем как Asia/Almaty
         deadline = datetime.datetime.fromisoformat(deadline_iso).replace(tzinfo=KZ_TZ)
-
         t = Ticket(club=club, pc=pc, description=desc, deadline=deadline)
-        db.session.add(t)
-        db.session.commit()
+        db.session.add(t); db.session.commit()
 
         notify_telegram_new_ticket(t)
         return jsonify({"ok": True, "id": t.id})
     except Exception as e:
         db.session.rollback()
         app.logger.error(f"/api/tickets error: {e}")
+        return jsonify({"ok": False, "error": "server_error"}), 500
+
+@app.get("/api/tickets")
+def list_tickets():
+    """Фильтры: ?status=new|in_progress|done&club=...&days=...&limit=..."""
+    try:
+        q = Ticket.query
+        status = request.args.get("status")
+        club = request.args.get("club")
+        days = request.args.get("days", type=int)
+        limit = request.args.get("limit", default=200, type=int)
+
+        if status in ("new", "in_progress", "done"):
+            q = q.filter(Ticket.status == status)
+        if club:
+            q = q.filter(Ticket.club == club)
+        if days and days > 0:
+            since = datetime.datetime.now(tz=KZ_TZ) - datetime.timedelta(days=days)
+            q = q.filter(Ticket.created_at >= since)
+
+        q = q.order_by(Ticket.status.asc(), Ticket.deadline.asc(), Ticket.created_at.desc())
+        rows = q.limit(min(limit, 500)).all()
+
+        def ser(t: Ticket):
+            return {
+                "id": t.id, "club": t.club, "pc": t.pc, "description": t.description,
+                "deadline": t.deadline.isoformat(), "status": t.status,
+                "created_at": t.created_at.isoformat(),
+                "last_reminded_at": t.last_reminded_at.isoformat() if t.last_reminded_at else None,
+            }
+        return jsonify({"ok": True, "items": [ser(t) for t in rows]})
+    except Exception as e:
+        app.logger.error(f"/api/tickets GET error: {e}")
         return jsonify({"ok": False, "error": "server_error"}), 500
 
 @app.post("/api/tickets/<int:tid>/status")
@@ -145,45 +179,6 @@ def set_status(tid: int):
         app.logger.error(f"/status error: {e}")
         return jsonify({"ok": False, "error": "server_error"}), 500
 
-@app.get("/api/tickets")
-def list_tickets():
-    """Список заявок с фильтрами: ?status=new|in_progress|done&club=...&days=...&limit=..."""
-    try:
-        q = Ticket.query
-
-        status = request.args.get("status")
-        club = request.args.get("club")
-        days = request.args.get("days", type=int)
-        limit = request.args.get("limit", default=100, type=int)
-
-        if status in ("new", "in_progress", "done"):
-            q = q.filter(Ticket.status == status)
-        if club:
-            q = q.filter(Ticket.club == club)
-        if days and days > 0:
-            since = datetime.datetime.now(tz=KZ_TZ) - datetime.timedelta(days=days)
-            q = q.filter(Ticket.created_at >= since)
-
-        q = q.order_by(Ticket.status.asc(), Ticket.deadline.asc(), Ticket.created_at.desc())
-        rows = q.limit(min(limit, 500)).all()
-
-        def ser(t: Ticket):
-            return {
-                "id": t.id,
-                "club": t.club,
-                "pc": t.pc,
-                "description": t.description,
-                "deadline": t.deadline.isoformat(),
-                "status": t.status,
-                "created_at": t.created_at.isoformat(),
-                "last_reminded_at": t.last_reminded_at.isoformat() if t.last_reminded_at else None,
-            }
-
-        return jsonify({"ok": True, "items": [ser(t) for t in rows]})
-    except Exception as e:
-        app.logger.error(f"/api/tickets GET error: {e}")
-        return jsonify({"ok": False, "error": "server_error"}), 500
-
 # -------------------- Cron: reminders ----------------
 @app.get("/cron/remind")
 def cron_remind():
@@ -191,7 +186,7 @@ def cron_remind():
         return "forbidden", 403
 
     now = datetime.datetime.now(tz=KZ_TZ)
-    period_sec = int(os.getenv("REMIND_EVERY_SEC", "14400"))  # по умолчанию 4 часа
+    period_sec = int(os.getenv("REMIND_EVERY_SEC", "14400"))
     sent = 0
 
     for t in Ticket.query.filter(Ticket.status != "done").all():
@@ -199,17 +194,17 @@ def cron_remind():
         if need:
             tg_api("sendMessage", {
                 "chat_id": os.getenv("TELEGRAM_CHAT_ID"),
-                "text": (
-                    f"⏳ Напоминание · ID {t.id}\n"
-                    f"🏢 {t.club} · 💻 {t.pc}\n"
-                    f"❗ {t.description}\n"
-                    f"⏰ Срок: {t.deadline.strftime('%d.%m %H:%M')}\n"
-                    f"Статус: {t.status.upper()}"
-                )
+                "text": msg_ticket_text(t, "Напоминание"),
+                "parse_mode": "HTML",
+                "reply_markup": {
+                    "inline_keyboard": [[
+                        {"text": "🔄 В работе", "callback_data": f"status:{t.id}:in_progress"},
+                        {"text": "✅ Выполнено", "callback_data": f"status:{t.id}:done"}
+                    ]]
+                }
             })
             t.last_reminded_at = now
             sent += 1
-
     db.session.commit()
     return jsonify({"reminders_sent": sent})
 
@@ -217,7 +212,7 @@ def cron_remind():
 @app.get("/health")
 def health():
     try:
-        db.session.execute(text("SELECT 1"))  # одновременно «будит» БД
+        db.session.execute(text("SELECT 1"))
         return "ok", 200
     except Exception as e:
         app.logger.error(f"health db error: {e}")
@@ -226,7 +221,6 @@ def health():
 # -------------------- Telegram webhook ----------------
 @app.post("/telegram/webhook")
 def telegram_webhook():
-    # Простая защита заголовком
     secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
     recv = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if secret and recv != secret:
@@ -235,10 +229,9 @@ def telegram_webhook():
     upd = request.get_json(force=True) or {}
     app.logger.info(f"tg update: {json.dumps(upd)[:500]}")
 
-    # Ограничим на твой личный чат
     owner_chat = str(os.getenv("TELEGRAM_CHAT_ID", ""))
 
-    # Команды
+    # команды
     msg = upd.get("message")
     if msg:
         chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -248,11 +241,11 @@ def telegram_webhook():
         if text_in in ("/start", "/help"):
             tg_api("sendMessage", {
                 "chat_id": chat_id,
-                "text": "Готово. Я присылаю заявки и принимаю статусы по кнопкам.\nКоманды: /start, /help"
+                "text": "Я присылаю заявки и принимаю статусы по кнопкам. Команды: /start, /help"
             })
             return "ok"
 
-    # Кнопки (callback_query)
+    # кнопки
     cq = upd.get("callback_query")
     if cq:
         data = cq.get("data") or ""
@@ -278,19 +271,11 @@ def telegram_webhook():
         t.status = new_status
         db.session.commit()
         tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"Статус: {new_status}"})
-
-        # Обновим текст без клавиатуры
-        new_text = (
-            f"📝 Заявка (ID {t.id})\n"
-            f"🏢 {t.club} · 💻 {t.pc}\n"
-            f"❗ {t.description}\n"
-            f"⏰ Срок: {t.deadline.strftime('%d.%m %H:%M')}\n"
-            f"Статус: {new_status.upper()}"
-        )
         tg_api("editMessageText", {
             "chat_id": chat_id,
             "message_id": message_id,
-            "text": new_text
+            "text": msg_ticket_text(t, "Заявка"),
+            "parse_mode": "HTML"
         })
         return "ok"
 
