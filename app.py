@@ -20,13 +20,13 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-# нормализуем старый формат
+# Нормализуем старый формат
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-# пул/пинг — чтобы переживать «сон» соединений у бесплатных БД
+# Пул/пинг — переживать «сон» соединений у бесплатных БД
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_pre_ping": True,
     "pool_recycle": 280,
@@ -52,7 +52,7 @@ class Ticket(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.datetime.now(tz=KZ_TZ))
     last_reminded_at = db.Column(db.DateTime, nullable=True)
 
-# мягкий старт БД (если Neon/Render проснулся не сразу)
+# Мягкий старт БД (если Neon/Render проснулся не сразу)
 def init_db_with_retry(retries=5, delay=2):
     for i in range(retries):
         try:
@@ -115,7 +115,7 @@ def create_ticket():
         if not all([club, pc, desc, deadline_iso]):
             return jsonify({"ok": False, "error": "club, pc, description, deadline_iso required"}), 400
 
-        # трактуем как Asia/Almaty
+        # Трактуем как Asia/Almaty
         deadline = datetime.datetime.fromisoformat(deadline_iso).replace(tzinfo=KZ_TZ)
 
         t = Ticket(club=club, pc=pc, description=desc, deadline=deadline)
@@ -144,7 +144,8 @@ def set_status(tid: int):
         db.session.rollback()
         app.logger.error(f"/status error: {e}")
         return jsonify({"ok": False, "error": "server_error"}), 500
-        @app.get("/api/tickets")
+
+@app.get("/api/tickets")
 def list_tickets():
     """Список заявок с фильтрами: ?status=new|in_progress|done&club=...&days=...&limit=..."""
     try:
@@ -182,7 +183,6 @@ def list_tickets():
     except Exception as e:
         app.logger.error(f"/api/tickets GET error: {e}")
         return jsonify({"ok": False, "error": "server_error"}), 500
-
 
 # -------------------- Cron: reminders ----------------
 @app.get("/cron/remind")
@@ -226,7 +226,7 @@ def health():
 # -------------------- Telegram webhook ----------------
 @app.post("/telegram/webhook")
 def telegram_webhook():
-    # простая защита заголовком
+    # Простая защита заголовком
     secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
     recv = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if secret and recv != secret:
@@ -235,10 +235,10 @@ def telegram_webhook():
     upd = request.get_json(force=True) or {}
     app.logger.info(f"tg update: {json.dumps(upd)[:500]}")
 
-    # ограничим на твой личный чат
+    # Ограничим на твой личный чат
     owner_chat = str(os.getenv("TELEGRAM_CHAT_ID", ""))
 
-    # команды
+    # Команды
     msg = upd.get("message")
     if msg:
         chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -252,7 +252,7 @@ def telegram_webhook():
             })
             return "ok"
 
-    # кнопки (callback_query)
+    # Кнопки (callback_query)
     cq = upd.get("callback_query")
     if cq:
         data = cq.get("data") or ""
@@ -279,7 +279,7 @@ def telegram_webhook():
         db.session.commit()
         tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"Статус: {new_status}"})
 
-        # обновим текст без клавиатуры
+        # Обновим текст без клавиатуры
         new_text = (
             f"📝 Заявка (ID {t.id})\n"
             f"🏢 {t.club} · 💻 {t.pc}\n"
@@ -299,4 +299,3 @@ def telegram_webhook():
 # -------------------- Local run ----------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-
