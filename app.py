@@ -274,7 +274,11 @@ def telegram_webhook():
                 "parse_mode": "HTML"
             })
             return "ok"
-            if text_in.startswith("/done"):
+            
+           
+        return "ok"
+
+     if text_in.startswith("/done"):
     parts = text_in.split()
     if len(parts) == 2 and parts[1].isdigit():
         sid = int(parts[1])
@@ -303,9 +307,6 @@ if text_in.startswith("/work"):
     else:
         tg_api("sendMessage", {"chat_id": chat_id, "text": "Использование: /work <ID>"})
     return "ok"
-
-
-        return "ok"
 
     # 3) Нажатия на кнопки
     cq = upd.get("callback_query")
@@ -396,6 +397,7 @@ if text_in.startswith("/work"):
 # -------------------- Local run ----------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
 
 
 
