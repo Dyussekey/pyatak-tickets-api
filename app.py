@@ -14,20 +14,18 @@ import requests
 # Config
 # ----------------------------------------------------------------------------
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # Render/Heroku-style URL
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    # SQLAlchemy 2.x expects postgresql://
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+import os
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # optional
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")      # optional
+db_url = os.environ.get("DATABASE_URL", "sqlite:///tickets.db")
 
-app = Flask(__name__)
-CORS(app)
+# Render часто даёт "postgres://..." или "postgresql://..."
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
+elif db_url.startswith("postgresql://") and "+psycopg" not in db_url and "+psycopg2" not in db_url:
+    db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
-app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL or "sqlite:///local.db"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["JSON_SORT_KEYS"] = False
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+
 
 db = SQLAlchemy(app)
 
