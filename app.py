@@ -6,9 +6,6 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 import requests
 
-# ------------------------
-# Конфиг и инициализация
-# ------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
 
@@ -16,7 +13,6 @@ def _db_url():
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
-    # Render даёт postgres:// — конвертируем под psycopg3
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg://", 1)
     elif url.startswith("postgresql://"):
@@ -28,7 +24,6 @@ app.config["SQLALCHEMY_DATABASE_URI"] = _db_url()
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
-# Разрешаем фронту ходить на API
 CORS(app, origins=[os.environ.get("FRONTEND_ORIGIN", "*")])
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -36,9 +31,7 @@ WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 DEFAULT_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0")) or None
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
-# ------------------------
-# Модель
-# ------------------------
+# -------- Модель --------
 class Ticket(db.Model):
     __tablename__ = "tickets"
 
@@ -47,10 +40,9 @@ class Ticket(db.Model):
     pc = db.Column(db.String(120), nullable=True)
     description = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(20), nullable=False, default="new")
-    # Главное исправление: используем колонку БД "deadline", но наружу поле называется deadline_at
-    deadline_at = db.Column("deadline", db.DateTime, nullable=True)
+    deadline_at = db.Column("deadline", db.DateTime, nullable=True)  # маппим на колонку deadline
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=True, default=datetime.utcnow, onupdate=datetime.utcnow)  # nullable=True — чтобы не падать, пока колонку добавляем
     tg_chat_id = db.Column(db.BigInteger, nullable=True)
     tg_message_id = db.Column(db.BigInteger, nullable=True)
 
@@ -68,36 +60,47 @@ class Ticket(db.Model):
             "tg_message_id": self.tg_message_id,
         }
 
-with app.app_context():
-    db.create_all()
+# -------- one-shot миграция схемы --------
+def ensure_schema():
+    """Добаляет недостающие колонки в существующей таблице tickets (idempotent)."""
+    insp = db.inspect(db.engine)
+    try:
+        cols = {c["name"] for c in insp.get_columns("tickets")}
+    except Exception as e:
+        log.warning("inspect get_columns failed: %s", e)
+        cols = set()
 
-# ------------------------
-# Утилиты
-# ------------------------
-STATUS_EMOJI = {
-    "new": "🆕",
-    "in_progress": "⏳",
-    "done": "✅",
-    "cancelled": "🚫",
-}
+    with db.engine.begin() as conn:
+        if "deadline" not in cols:
+            log.info("Adding missing column tickets.deadline")
+            conn.exec_driver_sql("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS deadline TIMESTAMP NULL")
+
+        if "updated_at" not in cols:
+            log.info("Adding missing column tickets.updated_at")
+            conn.exec_driver_sql("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NULL")
+            # заполним исторические строки более осмысленно
+            conn.exec_driver_sql("UPDATE tickets SET updated_at = COALESCE(updated_at, created_at, NOW()) WHERE updated_at IS NULL")
+
+with app.app_context():
+    db.create_all()   # создаёт таблицу, если её вообще не было
+    try:
+        ensure_schema()  # допилит недостающие колонки, если таблица уже была старой
+    except Exception as e:
+        log.warning("ensure_schema failed: %s", e)
+
+# -------- Утилиты --------
+STATUS_EMOJI = {"new": "🆕", "in_progress": "⏳", "done": "✅", "cancelled": "🚫"}
 
 def human_status(s: str) -> str:
-    return {
-        "new": "Новая",
-        "in_progress": "В работе",
-        "done": "Выполнено",
-        "cancelled": "Отменено",
-    }.get(s, s)
+    return {"new": "Новая", "in_progress": "В работе", "done": "Выполнено", "cancelled": "Отменено"}.get(s, s)
 
 def parse_dt(s: str | None):
     if not s:
         return None
     try:
-        # ISO 8601
         return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
     except Exception:
         try:
-            # "YYYY-MM-DD HH:MM"
             return datetime.strptime(s, "%Y-%m-%d %H:%M")
         except Exception:
             return None
@@ -138,12 +141,7 @@ def tg_call(method: str, payload: dict):
 def send_ticket_message(t: Ticket, chat_id: int | None = None):
     if not (BOT_TOKEN and (chat_id or DEFAULT_CHAT_ID)):
         return
-    payload = {
-        "chat_id": chat_id or DEFAULT_CHAT_ID,
-        "text": format_ticket_text(t),
-        "reply_markup": keyboard_for_ticket(t),
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": chat_id or DEFAULT_CHAT_ID, "text": format_ticket_text(t), "reply_markup": keyboard_for_ticket(t), "parse_mode": "HTML"}
     data = tg_call("sendMessage", payload)
     if data.get("ok"):
         msg = data["result"]
@@ -154,13 +152,7 @@ def send_ticket_message(t: Ticket, chat_id: int | None = None):
 def edit_ticket_message(t: Ticket):
     if not (BOT_TOKEN and t.tg_chat_id and t.tg_message_id):
         return
-    payload = {
-        "chat_id": t.tg_chat_id,
-        "message_id": t.tg_message_id,
-        "text": format_ticket_text(t),
-        "reply_markup": keyboard_for_ticket(t),
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": t.tg_chat_id, "message_id": t.tg_message_id, "text": format_ticket_text(t), "reply_markup": keyboard_for_ticket(t), "parse_mode": "HTML"}
     tg_call("editMessageText", payload)
 
 def answer_callback(cb_id: str, text: str):
@@ -172,22 +164,22 @@ def set_status(t: Ticket, status: str):
     db.session.commit()
     edit_ticket_message(t)
 
-# ------------------------
-# HTTP маршруты
-# ------------------------
+# -------- HTTP --------
 @app.get("/")
-def index():
-    return "ok", 200
+def index(): return "ok", 200
 
 @app.get("/health")
-def health():
-    return "ok", 200
+def health(): return "ok", 200
 
 @app.get("/api/tickets")
 def list_tickets():
     limit = int(request.args.get("limit", "100"))
     limit = max(1, min(limit, 500))
-    items = Ticket.query.order_by(Ticket.created_at.desc()).limit(limit).all()
+    q = Ticket.query
+    status = request.args.get("status")
+    if status:
+        q = q.filter(Ticket.status == status)
+    items = q.order_by(Ticket.created_at.desc()).limit(limit).all()
     return jsonify([t.to_dict() for t in items])
 
 @app.post("/api/tickets")
@@ -202,7 +194,6 @@ def create_ticket():
     )
     db.session.add(t)
     db.session.commit()
-    # отправим карточку в ТГ (если задан чат)
     send_ticket_message(t, chat_id=data.get("tg_chat_id") or DEFAULT_CHAT_ID)
     return jsonify(t.to_dict()), 201
 
@@ -212,27 +203,19 @@ def update_ticket(ticket_id: int):
     if not t:
         abort(404)
     data = request.get_json(force=True, silent=True) or {}
-    if "status" in data:
-        t.status = data["status"]
-    if "club" in data:
-        t.club = data["club"]
-    if "pc" in data:
-        t.pc = data["pc"]
-    if "description" in data:
-        t.description = data["description"]
-    if "deadline_at" in data:
-        t.deadline_at = parse_dt(data["deadline_at"])
+    if "status" in data: t.status = data["status"]
+    if "club" in data: t.club = data["club"]
+    if "pc" in data: t.pc = data["pc"]
+    if "description" in data: t.description = data["description"]
+    if "deadline_at" in data: t.deadline_at = parse_dt(data["deadline_at"])
     t.updated_at = datetime.utcnow()
     db.session.commit()
     edit_ticket_message(t)
     return jsonify(t.to_dict())
 
-# ------------------------
-# Telegram webhook
-# ------------------------
+# -------- Telegram webhook --------
 @app.post("/telegram/webhook")
 def telegram_webhook():
-    # проверка секрета (Telegram присылает в заголовке)
     if WEBHOOK_SECRET:
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if secret != WEBHOOK_SECRET:
@@ -241,7 +224,6 @@ def telegram_webhook():
     payload = request.get_json(force=True, silent=True) or {}
     log.info("tg update: %s", payload)
 
-    # callback кнопок
     if "callback_query" in payload:
         cq = payload["callback_query"]
         cb_id = cq.get("id")
@@ -250,36 +232,29 @@ def telegram_webhook():
             _, action, sid = data.split(":")
             sid = int(sid)
         except Exception:
-            if cb_id:
-                answer_callback(cb_id, "Неверные данные кнопки")
+            if cb_id: answer_callback(cb_id, "Неверные данные кнопки")
             return "ok", 200
 
         t = db.session.get(Ticket, sid)
         if not t:
-            if cb_id:
-                answer_callback(cb_id, "Заявка не найдена")
+            if cb_id: answer_callback(cb_id, "Заявка не найдена")
             return "ok", 200
 
         if action in ("new", "in_progress", "done", "cancelled"):
             set_status(t, action)
-            if cb_id:
-                answer_callback(cb_id, f"Статус: {human_status(action)}")
+            if cb_id: answer_callback(cb_id, f"Статус: {human_status(action)}")
         else:
-            if cb_id:
-                answer_callback(cb_id, "Неизвестное действие")
+            if cb_id: answer_callback(cb_id, "Неизвестное действие")
         return "ok", 200
 
-    # обычные сообщения/команды
     msg = payload.get("message") or {}
     text_in = (msg.get("text") or "").strip()
 
     if text_in.startswith("/help") or text_in.startswith("/start"):
-        _help = (
-            "Команды:\n"
-            "/help — помощь\n"
-            "/done <id> — отметить заявку как Выполнено\n"
-            "Также используйте кнопки под карточкой заявки."
-        )
+        _help = ("Команды:\n"
+                 "/help — помощь\n"
+                 "/done <id> — отметить заявку как Выполнено\n"
+                 "Также используйте кнопки под карточкой заявки.")
         if BOT_TOKEN:
             tg_call("sendMessage", {"chat_id": msg["chat"]["id"], "text": _help})
         return "ok", 200
@@ -298,11 +273,7 @@ def telegram_webhook():
             tg_call("sendMessage", {"chat_id": msg["chat"]["id"], "text": "Формат: /done <id>"})
         return "ok", 200
 
-    # по умолчанию — игнор
     return "ok", 200
 
-# ------------------------
-# WSGI
-# ------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
