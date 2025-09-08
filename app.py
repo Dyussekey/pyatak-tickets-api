@@ -1,254 +1,379 @@
 import os
-import logging
+import json
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
+import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text
+from sqlalchemy import event, text
+from sqlalchemy.exc import IntegrityError
 
-import requests
+# -----------------------------
+# Flask app (создаём СРАЗУ)
+# -----------------------------
+app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ----------------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------------
-
-import os
-
+# -----------------------------
+# DB URL fix для psycopg v3
+# -----------------------------
 db_url = os.environ.get("DATABASE_URL", "sqlite:///tickets.db")
-
-# Render часто даёт "postgres://..." или "postgresql://..."
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
 elif db_url.startswith("postgresql://") and "+psycopg" not in db_url and "+psycopg2" not in db_url:
     db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
-
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-# ----------------------------------------------------------------------------
-# Model
-# ----------------------------------------------------------------------------
-
+# -----------------------------
+# Модель
+# -----------------------------
 class Ticket(db.Model):
     __tablename__ = "tickets"
 
     id = db.Column(db.Integer, primary_key=True)
-    club = db.Column(db.String(255), nullable=False, default="")
-    pc = db.Column(db.String(255), nullable=False, default="")
-    description = db.Column(db.String(1024), nullable=False, default="")
+    club = db.Column(db.String(100), nullable=False)
+    pc = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.String(1000), nullable=False)
     status = db.Column(db.String(50), nullable=False, default="new")
 
-    # deadline может быть пустым
+    # ВАЖНО: deadline допускаем NULL (иначе были 500 при None)
     deadline = db.Column(db.DateTime, nullable=True)
 
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, nullable=True, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, nullable=False, server_default=db.func.now())
+    # раньше падало из-за отсутствия этой колонки — теперь есть и допускает NULL
+    updated_at = db.Column(db.DateTime, nullable=True, server_default=db.func.now())
 
+    # Колонки для записи сообщений в ТГ (могут быть NULL)
     tg_chat_id = db.Column(db.BigInteger, nullable=True)
     tg_message_id = db.Column(db.BigInteger, nullable=True)
 
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "club": self.club,
+            "pc": self.pc,
+            "description": self.description,
+            "status": self.status,
+            "deadline": self.deadline.isoformat() if self.deadline else None,
+            "created_at": (self.created_at.isoformat() if isinstance(self.created_at, datetime) else str(self.created_at)),
+            "updated_at": (self.updated_at.isoformat() if isinstance(self.updated_at, datetime) else str(self.updated_at) if self.updated_at else None),
+            "tg_chat_id": self.tg_chat_id,
+            "tg_message_id": self.tg_message_id,
+        }
 
-# ----------------------------------------------------------------------------
-# Utilities
-# ----------------------------------------------------------------------------
+# Обновляем updated_at перед апдейтом
+@event.listens_for(Ticket, "before_update")
+def _touch_updated_at(mapper, connection, target):
+    target.updated_at = datetime.utcnow()
 
-def _ts(v: Optional[datetime]) -> Optional[str]:
-    return v.isoformat() if v else None
 
-def serialize_ticket(t: Ticket) -> dict:
-    return {
-        "id": t.id,
-        "club": t.club,
-        "pc": t.pc,
-        "description": t.description,
-        "status": t.status,
-        "deadline": _ts(t.deadline),
-        "created_at": _ts(t.created_at),
-        "updated_at": _ts(t.updated_at),
-        "tg_chat_id": t.tg_chat_id,
-        "tg_message_id": t.tg_message_id,
+# -----------------------------
+# "Мягкая миграция" при старте
+# -----------------------------
+with app.app_context():
+    engine = db.engine
+    # если таблицы нет — просто создадим её по модели
+    with engine.begin() as conn:
+        exists = conn.exec_driver_sql("SELECT to_regclass('tickets')").scalar()
+
+    if not exists:
+        db.create_all()
+    else:
+        # Добьём недостающие колонки и снимем NOT NULL с deadline
+        stmts = [
+            "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();",
+            "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS tg_chat_id BIGINT;",
+            "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS tg_message_id BIGINT;",
+            "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS deadline TIMESTAMP;",
+            "ALTER TABLE tickets ALTER COLUMN deadline DROP NOT NULL;",
+        ]
+        with engine.begin() as conn:
+            for s in stmts:
+                try:
+                    conn.exec_driver_sql(text(s))
+                except Exception as e:
+                    app.logger.warning(f"Skip stmt `{s}`: {e}")
+
+        # На всякий случай создадим таблицы, если каких-то вообще не было
+        db.create_all()
+
+
+# -----------------------------
+# Утилиты
+# -----------------------------
+ALLOWED_STATUSES = {"new", "in_progress", "done", "cancelled"}
+
+def parse_deadline(raw: Optional[str]) -> Optional[datetime]:
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    # Пытаемся ISO
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        pass
+    # Популярный формат DD.MM.YYYY HH:MM
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except Exception:
+            continue
+    return None
+
+
+# -----------------------------
+# Телеграм
+# -----------------------------
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
+
+def tg_send_ticket(ticket: Ticket) -> Tuple[Optional[int], Optional[int]]:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        app.logger.info("Telegram envs not set — skip sending")
+        return None, None
+
+    text_lines = [
+        f"🆕 *Новая заявка #{ticket.id}*",
+        f"*Клуб:* {ticket.club}",
+        f"*ПК:* {ticket.pc}",
+        f"*Описание:* {ticket.description}",
+    ]
+    if ticket.deadline:
+        text_lines.append(f"*Дедлайн:* {ticket.deadline.strftime('%d.%m.%Y %H:%M')}")
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "В работу", "callback_data": f"ticket:{ticket.id}:in_progress"},
+                {"text": "Готово ✅", "callback_data": f"ticket:{ticket.id}:done"},
+            ],
+            [
+                {"text": "Отменить ❌", "callback_data": f"ticket:{ticket.id}:cancelled"},
+            ],
+        ]
     }
 
-def safe_fromisoformat(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
     try:
-        # поддержка "Z"
-        s2 = s.replace("Z", "+00:00")
-        return datetime.fromisoformat(s2)
-    except Exception:
-        return None
-
-def telegram_send(ticket: Ticket) -> Optional[int]:
-    """Отправляем в Telegram. Возвращаем message_id или None. Никогда не кидаем исключения наружу."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        app.logger.info("Telegram is not configured, skip send.")
-        return None
-
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        text_msg = f"🆕 Заявка #{ticket.id}\nКлуб: {ticket.club}\nПК: {ticket.pc}\nОписание: {ticket.description}"
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text_msg,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return (data.get("result") or {}).get("message_id")
+        resp = requests.post(
+            f"{TG_API}/sendMessage",
+            json={
+                "chat_id": int(TELEGRAM_CHAT_ID),
+                "text": "\n".join(text_lines),
+                "parse_mode": "Markdown",
+                "reply_markup": keyboard,
+            },
+            timeout=10,
+        )
+        data = resp.json()
+        if resp.ok and data.get("ok"):
+            msg = data.get("result", {})
+            return msg.get("chat", {}).get("id"), msg.get("message_id")
+        else:
+            app.logger.warning(f"TG sendMessage not ok: {data}")
+            return None, None
     except Exception as e:
-        app.logger.error("Telegram send failed: %s", e, exc_info=True)
-        return None
+        app.logger.warning(f"TG send failed: {e}")
+        return None, None
 
-# ----------------------------------------------------------------------------
-# Schema bootstrap (idempotent). Ensures columns exist and deadline is nullable.
-# ----------------------------------------------------------------------------
 
-def ensure_schema():
-    with app.app_context():
-        engine = db.engine
-        # 1) Создаём таблицу если её нет
-        engine.execute(text("""
-        CREATE TABLE IF NOT EXISTS tickets (
-            id SERIAL PRIMARY KEY,
-            club VARCHAR(255) NOT NULL DEFAULT '',
-            pc VARCHAR(255) NOT NULL DEFAULT '',
-            description VARCHAR(1024) NOT NULL DEFAULT '',
-            status VARCHAR(50) NOT NULL DEFAULT 'new',
-            deadline TIMESTAMP NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMP NULL,
-            tg_chat_id BIGINT NULL,
-            tg_message_id BIGINT NULL
-        );
-        """))
+def tg_edit_buttons(chat_id: int, message_id: int, new_status: str):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    label = {
+        "new": "Новая",
+        "in_progress": "В работе",
+        "done": "Готово ✅",
+        "cancelled": "Отменено ❌",
+    }.get(new_status, new_status)
 
-        # 2) На всякий случай докидываем отсутствующие колонки и дефолты
-        engine.execute(text("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS club VARCHAR(255) NOT NULL DEFAULT '';"))
-        engine.execute(text("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS pc VARCHAR(255) NOT NULL DEFAULT '';"))
-        engine.execute(text("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS description VARCHAR(1024) NOT NULL DEFAULT '';"))
-        engine.execute(text("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS status VARCHAR(50) NOT NULL DEFAULT 'new';"))
-        engine.execute(text("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS deadline TIMESTAMP NULL;"))
-        engine.execute(text("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();"))
-        engine.execute(text("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NULL;"))
-        engine.execute(text("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS tg_chat_id BIGINT NULL;"))
-        engine.execute(text("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS tg_message_id BIGINT NULL;"))
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": f"Статус: {label}", "callback_data": "noop"}]
+        ]
+    }
+    try:
+        requests.post(
+            f"{TG_API}/editMessageReplyMarkup",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": keyboard,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        app.logger.warning(f"TG edit failed: {e}")
 
-        # 3) Убедимся, что deadline допускает NULL (если раньше был NOT NULL)
-        engine.execute(text("ALTER TABLE tickets ALTER COLUMN deadline DROP NOT NULL;"))
 
-        # 4) Индексы (опционально)
-        engine.execute(text("CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets (created_at DESC);"))
-        engine.execute(text("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets (status);"))
-
-# В некоторых окружениях SQLAlchemy ленится создавать файл SQLite — подстрахуемся
-with app.app_context():
-    db.create_all()
-    ensure_schema()
-
-# ----------------------------------------------------------------------------
-# Routes
-# ----------------------------------------------------------------------------
-
-@app.get("/")
-def root():
-    return "OK", 200
-
+# -----------------------------
+# Маршруты
+# -----------------------------
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"}), 200
+    return "OK", 200
+
 
 @app.get("/api/tickets")
 def list_tickets():
-    status = request.args.get("status")
     try:
-        limit = int(request.args.get("limit", 100))
-    except Exception:
-        limit = 100
-    limit = max(1, min(limit, 500))
+        status = request.args.get("status")
+        limit = int(request.args.get("limit") or 300)
+        q = Ticket.query
+        if status:
+            q = q.filter(Ticket.status == status)
+        items = q.order_by(Ticket.created_at.desc()).limit(limit).all()
+        return jsonify([i.to_dict() for i in items]), 200
+    except Exception as e:
+        app.logger.exception("Unhandled error in list_tickets")
+        return jsonify({"error": "server_error"}), 500
 
-    q = Ticket.query
-    if status:
-        q = q.filter(Ticket.status == status)
-
-    items = q.order_by(Ticket.created_at.desc()).limit(limit).all()
-    return jsonify([serialize_ticket(t) for t in items]), 200
 
 @app.post("/api/tickets")
 def create_ticket():
-    payload = request.get_json(force=True, silent=True) or {}
-
-    deadline = safe_fromisoformat(payload.get("deadline"))
-    t = Ticket(
-        club=(payload.get("club") or "").strip(),
-        pc=(payload.get("pc") or "").strip(),
-        description=(payload.get("description") or "").strip(),
-        status=(payload.get("status") or "new").strip() or "new",
-        deadline=deadline,
-    )
-    db.session.add(t)
-    db.session.commit()  # сначала создаём тикет
-
-    # Параллельно пытаемся отправить в ТГ, но не валим ответ
     try:
-        msg_id = telegram_send(t)
-        if msg_id:
-            t.tg_message_id = msg_id
-            # tg_chat_id нам известен из конфигурации; сохранять не обязательно
-            if TELEGRAM_CHAT_ID:
-                try:
-                    t.tg_chat_id = int(TELEGRAM_CHAT_ID)
-                except Exception:
-                    pass
-            db.session.commit()
-    except Exception as e:
-        app.logger.error("Telegram notify failed: %s", e, exc_info=True)
+        data = request.get_json(force=True, silent=False) or {}
+        club = (data.get("club") or "").strip()
+        pc = (data.get("pc") or "").strip()
+        description = (data.get("description") or "").strip()
+        status = (data.get("status") or "new").strip() or "new"
+        deadline_raw = data.get("deadline")
 
-    return jsonify(serialize_ticket(t)), 201
+        if not club or not pc or not description:
+            return jsonify({"error": "bad_request", "details": "club, pc, description обязательны"}), 400
+
+        if status not in ALLOWED_STATUSES:
+            status = "new"
+
+        deadline = parse_deadline(deadline_raw)
+
+        t = Ticket(
+            club=club,
+            pc=pc,
+            description=description,
+            status=status,
+            deadline=deadline,
+        )
+        db.session.add(t)
+        db.session.commit()  # нужно получить id
+
+        # Пытаемся отправить в ТГ, но если не получится — это не 500
+        chat_id, msg_id = tg_send_ticket(t)
+        if chat_id and msg_id:
+            t.tg_chat_id = chat_id
+            t.tg_message_id = msg_id
+            db.session.commit()
+
+        return jsonify(t.to_dict()), 201
+    except IntegrityError as e:
+        db.session.rollback()
+        # Защитимся от NOT NULL и т.п.
+        return jsonify({"error": "bad_request", "details": "DB integrity error"}), 400
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("Unhandled error in create_ticket")
+        return jsonify({"error": "server_error"}), 500
+
 
 @app.patch("/api/tickets/<int:ticket_id>")
 def update_ticket(ticket_id: int):
-    payload = request.get_json(force=True, silent=True) or {}
-    t = Ticket.query.get_or_404(ticket_id)
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+        t: Ticket = Ticket.query.get_or_404(ticket_id)
 
-    # Обновляем только разрешённые поля
-    if "club" in payload:
-        t.club = (payload.get("club") or "").strip()
-    if "pc" in payload:
-        t.pc = (payload.get("pc") or "").strip()
-    if "description" in payload:
-        t.description = (payload.get("description") or "").strip()
-    if "status" in payload:
-        t.status = (payload.get("status") or t.status).strip() or t.status
-    if "deadline" in payload:
-        t.deadline = safe_fromisoformat(payload.get("deadline"))
+        # апдейтим что пришло
+        if "status" in data:
+            st = str(data["status"]).strip()
+            if st in ALLOWED_STATUSES:
+                t.status = st
 
-    db.session.commit()
-    return jsonify(serialize_ticket(t)), 200
+        if "description" in data:
+            d = str(data["description"]).strip()
+            if d:
+                t.description = d
 
-# ----------------------------------------------------------------------------
-# Error handlers — всегда возвращаем JSON, чтобы фронт не спотыкался о HTML
-# ----------------------------------------------------------------------------
+        if "deadline" in data:
+            t.deadline = parse_deadline(data["deadline"])
 
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({"error": "not_found"}), 404
+        db.session.commit()
 
-@app.errorhandler(Exception)
-def handle_error(e):
-    # Логируем, но наружу — аккуратный JSON
-    app.logger.error("Unhandled error: %s", e, exc_info=True)
-    return jsonify({"error": "server_error"}), 500
+        # Если есть сообщение в ТГ — подправим кнопки
+        if t.tg_chat_id and t.tg_message_id:
+            tg_edit_buttons(t.tg_chat_id, t.tg_message_id, t.status)
 
-# ----------------------------------------------------------------------------
-# WSGI
-# ----------------------------------------------------------------------------
+        return jsonify(t.to_dict()), 200
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("Unhandled error in update_ticket")
+        return jsonify({"error": "server_error"}), 500
+
+
+# Вебхук Telegram для кнопок
+@app.post("/telegram/webhook")
+def telegram_webhook():
+    try:
+        update = request.get_json(force=True, silent=True) or {}
+        cb = update.get("callback_query")
+        if not cb:
+            return jsonify({"ok": True}), 200
+
+        data = cb.get("data") or ""
+        # ожидаем формат: ticket:<id>:<status>
+        if not data.startswith("ticket:"):
+            return jsonify({"ok": True}), 200
+
+        parts = data.split(":")
+        if len(parts) != 3:
+            return jsonify({"ok": True}), 200
+
+        _, sid, st = parts
+        if st not in ALLOWED_STATUSES:
+            st = "in_progress"
+
+        ticket = Ticket.query.get(int(sid))
+        if not ticket:
+            # ответим в ТГ, что не нашли
+            requests.post(f"{TG_API}/answerCallbackQuery", json={
+                "callback_query_id": cb.get("id"),
+                "text": "Заявка не найдена",
+                "show_alert": False
+            }, timeout=10)
+            return jsonify({"ok": True}), 200
+
+        ticket.status = st
+        db.session.commit()
+
+        # Ответим на нажатие, поправим клавиатуру
+        try:
+            requests.post(f"{TG_API}/answerCallbackQuery", json={
+                "callback_query_id": cb.get("id"),
+                "text": f"Статус: {st}",
+                "show_alert": False
+            }, timeout=10)
+        except Exception:
+            pass
+
+        if ticket.tg_chat_id and ticket.tg_message_id:
+            tg_edit_buttons(ticket.tg_chat_id, ticket.tg_message_id, st)
+
+        return jsonify({"ok": True}), 200
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("Unhandled error in telegram_webhook")
+        return jsonify({"ok": False}), 200
+
+
+# -----------------------------
+# Точка входа для локала
+# -----------------------------
 if __name__ == "__main__":
-    # Локальный запуск: python app.py
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
