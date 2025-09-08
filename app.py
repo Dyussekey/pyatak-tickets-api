@@ -7,7 +7,6 @@ import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError
 
 # -----------------------------
@@ -93,10 +92,11 @@ with app.app_context():
             "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS deadline TIMESTAMP;",
             "ALTER TABLE tickets ALTER COLUMN deadline DROP NOT NULL;",
         ]
-        with engine.begin() as conn:
+       with engine.begin() as conn:
             for s in stmts:
                 try:
-                    conn.exec_driver_sql(text(s))
+                    # ВАЖНО: передаём СТРОКУ, а не text(s)
+                    conn.exec_driver_sql(s)
                 except Exception as e:
                     app.logger.warning(f"Skip stmt `{s}`: {e}")
 
