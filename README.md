@@ -1,30 +1,50 @@
-# Pyatak Tickets API
+# Pyatak Tickets API (fixed)
 
-## Render (Web Service)
-- Build Command:   pip install -r requirements.txt
-- Start Command:   gunicorn app:app
-- Environment:
-  DATABASE_URL=postgresql+psycopg2://USER:PASS@HOST/db?sslmode=require
-  CORS_ORIGIN=https://<STATIC-SITE>.onrender.com
-  TELEGRAM_BOT_TOKEN=...
-  TELEGRAM_CHAT_ID=...
-  TELEGRAM_WEBHOOK_SECRET=...
-  CRON_SECRET=...
-  REMIND_EVERY_SEC=14400
+Готовый минимальный бэкенд для ваших форм заявок (Render/Heroku/локально). Исправляет:
+- `server_error` после отправки (безопасная сериализация дат + безопасная отправка в Telegram),
+- падения при пустом `deadline`/`updated_at`,
+- HTML-ошибки вместо JSON (фронт больше не ломается),
+- отсутствие колонок в БД (`updated_at`, `tg_chat_id`, `tg_message_id`) — добавляются автоматически.
 
-## Webhook
-curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
-  -d "url=https://<API>.onrender.com/telegram/webhook" \
-  -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+## Быстрый старт (Render)
 
-## Health
-GET /health
+1. Создайте новый Web Service и укажите репозиторий с этими файлами.
+2. В **Environment** добавьте:
+   - `DATABASE_URL` — Postgres от Render
+   - (опционально) `TELEGRAM_BOT_TOKEN`
+   - (опционально) `TELEGRAM_CHAT_ID`
+3. **Start Command**: `gunicorn app:app`
+4. Деплой.
 
-## Tickets
-POST /api/tickets     {club, pc, description, deadline_iso}
-GET  /api/tickets     ?status=&club=&days=&limit=
-POST /api/tickets/<id>/status {status: new|in_progress|done}
+Сервис сам создаст/обновит схему таблицы `tickets` (idempotent).
 
-## Reminders
-GET /cron/remind?secret=<CRON_SECRET>
-(создать cron на cron-job.org — 10:00, 13:00, 16:00, 19:00, 22:00 Asia/Almaty)
+## Локально
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+export DATABASE_URL=sqlite:///local.db
+python app.py
+```
+
+## API
+
+- `GET /health` → `{ "status": "ok" }`
+- `GET /api/tickets?status=new&limit=300` → массив тикетов
+- `POST /api/tickets` → создаёт тикет
+  ```json
+  {
+    "club": "Пятак",
+    "pc": "ПК 7",
+    "description": "сломался принтер",
+    "status": "new",
+    "deadline": "2025-09-08T12:00:00Z"   // опционально
+  }
+  ```
+- `PATCH /api/tickets/<id>` — обновление полей (`status`, `deadline`, и т.д.)
+
+## Примечания
+
+- Если `TELEGRAM_*` не заданы — заявка всё равно создаётся, а отправка в ТГ просто пропускается.
+- Все ответы — **JSON**. Ошибки — тоже JSON (`{"error":"server_error"}`), без HTML.
+- Даты сериализуются безопасно, `null` допустим.
